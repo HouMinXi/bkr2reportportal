@@ -5,10 +5,9 @@ import re
 import logging
 import tempfile
 import zipfile
-from re import search
-
 import requests
 import argparse
+import json
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -27,8 +26,6 @@ parser.add_argument('-p', '--project', required=True,
                     help='Report Portal project name, e.g. mshi_personal')
 parser.add_argument('-t', '--token', required=True,
                     help='Report Portal token')
-parser.add_argument('-w', '--whiteboard', action='store_true',
-                    help='Use beaker whiteboard as launch name, it may fail if whiteboard is too long')
 parser.add_argument('-d', '--debug', action='store_true',
                     help='enable debug mode')
 args = parser.parse_args()
@@ -69,7 +66,8 @@ TASK_ID_PATTERN = re.compile(
 )
 TEST_BLOCK_TITLE_PATTERN = re.compile(r'(:{70,}\s*)\n::\s{2,}(.+?)\s*\n\1')
 
-def retry_download(max_retries=5, delay=10):
+
+def retry_download(max_retries=10, delay=10):
     def decorator(func):
         @wraps(func)
         def wrapper(*warp_args, **kwargs):
@@ -95,12 +93,12 @@ class JUnitLogProcessor:
         :param from_string: Indicates whether junit_xml_source is file (False) or a string (True)
         """
         self.debug = debug
-        self.host_role_map = {}  # key:role, value: hostname
+        self.host_role_map = {}  # key:hostname, value: role
         self.taskid_task_log_url = defaultdict(list)  # key:task_id, value:[taskout_url,..]
         self.taskid_resultid = defaultdict(list)  # key:task_id, value:[resultid,..]
         self.resultid_resultlog = defaultdict(list)  # key:resultid, value:[resultlog,..]
         self.url_context = {}  # key:logurl value: log
-        self.taskid_tests_block = dict() # key:task_id, value:dict{test_name:test_block}
+        self.taskid_tests_block = dict()  # key:task_id, value:dict{test_name:test_block}
         # parse jnuit
         if from_string:
             # from http request
@@ -128,7 +126,7 @@ class JUnitLogProcessor:
             self._parse_beaker_xml(beaker_root)
 
     def _parse_beaker_xml(self, xml_root):
-        """parse Beaker XML build thr host-role mapping host_role_map[hostname] = CLIENTS/SERVERS"""
+        """parse Beaker XML build the host-role mapping host_role_map[hostname] = CLIENTS/SERVERS"""
         try:
             for task in xml_root.findall('.//task'):
                 roles = task.find('roles')
@@ -147,7 +145,7 @@ class JUnitLogProcessor:
 
     def _rename_testsuite(self):
         """
-        Change the testsuite name to task_id + hostname + role.
+        Change the testsuite name to task_id + hostname + role. it will display on detail page on a launch
         """
         for ts in self.root.findall('testsuite'):
             ts_id = ts.get('id', '').strip()
@@ -161,6 +159,7 @@ class JUnitLogProcessor:
         # build mapping between taskid, resultid and log
         self.flushing_all_task()
         self.download_log_urls(session)
+        self.parse_task_out_logs()
         # attach taskout.log phase to subcases
         self._attach_logs_to_subcases()
 
@@ -213,7 +212,7 @@ class JUnitLogProcessor:
                         if result_id not in self.taskid_resultid.get(task_id):
                             self.taskid_resultid[task_id].append(result_id)
 
-    def _get_task_out_by_task_id(self, task_id: str) -> str:
+    def _get_taskout_by_task_id(self, task_id: str) -> str:
         urls = self.taskid_task_log_url.get(task_id)
         task_out_url = None
         for url in urls:
@@ -243,7 +242,7 @@ class JUnitLogProcessor:
 
     def parse_task_out_logs(self):
         for task_id in self.taskid_task_log_url.keys():
-            task_out = self._get_task_out_by_task_id(task_id)
+            task_out = self._get_taskout_by_task_id(task_id)
             if not task_out:
                 continue
             tests_block = self._parse_task_out_log(task_out)
@@ -258,6 +257,7 @@ class JUnitLogProcessor:
         return None
 
     def _attach_logs_to_subcases(self):
+        """Deal with the subcases of kernel test cases"""
         for testcase in self.root.findall('.//testcase'):
             classname = testcase.get('classname', '')
             name = testcase.get('name', '').strip()
@@ -265,6 +265,7 @@ class JUnitLogProcessor:
             if not classname.startswith('/kernel') or name == '(main)':
                 continue
             system_out = testcase.find('system-out')
+            # assume no output
             if len(system_out.text.strip().splitlines()) == 0:
                 continue
             task_id = self.search_task_id_from_system_out(system_out)
@@ -272,7 +273,7 @@ class JUnitLogProcessor:
                 logger.debug(f"didn't found task_id on sub kernel test cases: {classname} {name}")
                 continue
             if task_id in self.taskid_tests_block.keys():
-                test_block = self.taskid_tests_block.get(task_id).get(name)
+                test_block = self.taskid_tests_block.get(task_id).get(name, '')
             else:
                 continue
 
@@ -285,8 +286,9 @@ class JUnitLogProcessor:
                 log_content.append(test_block)
             else:
                 if self.debug:
-                    logger.debug("_attach_logs_to_subcases:" + test_block)
+                    logger.debug(f"can't find test_block on classname:{classname} name:{name} task_id:{task_id}")
                 log_content.append("\n=== No related log found in taskout.log ===")
+
             system_out.text = '\n'.join(log_content)
 
     def _clean_non_kernel(self):
@@ -418,10 +420,10 @@ def create_session() -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504, 520],
         allowed_methods=frozenset(['GET', 'POST']),
         respect_retry_after_header=True,
-        connect=3,
-        read=3,
-        redirect=2,
-        other=3
+        connect=60,
+        read=60,
+        redirect=60,
+        other=60
     )
     adapter = HTTPAdapter(
         max_retries=retries,
@@ -469,12 +471,25 @@ def upload_to_rp(zip_source_path: str, session: requests.Session):
         'Authorization': f'bearer {RP_TOKEN}',
         'accept': '*/*'
     }
+    # multipart/form-data data
+    # files = {'Field name': (file name, file object, MIME type)}
     with open(zip_source_path, 'rb') as f:
-        files = {'file': f, }
+        files = {
+            'file': (os.path.basename(zip_source_path), f, 'application/zip'),
+            'launchImportRq': (
+                None,
+                json.dumps({
+                    "description": f"Beaker Job {JOB_WEB_URL}",
+                    "mode": "DEFAULT",
+                    "name": f"Beaker Job {JOB_ID}"
+                }),
+                'application/json'
+            )
+        }
         logger.info("upload ReportPortal：%s", zip_source_path)
-        resp = session.post(rp_url, headers=headers, files=files, timeout=60)
+        resp = session.post(rp_url, headers=headers, files=files, timeout=300)
     resp.raise_for_status()
-    # r.json method to parse it into Python dict objects.
+    # resp.json method to parse it into Python dict objects.
     data = resp.json()
     launch_uuid = data.get('data').get('id')
     launch_message = data.get('message')
@@ -482,30 +497,12 @@ def upload_to_rp(zip_source_path: str, session: requests.Session):
     get_url = f"{RP_BASE}/api/v1/{RP_PROJECT}/launch/{launch_uuid}"
     info = requests.get(get_url, headers=headers).json()
     launch_id = info['id']
-    desc = JOB_WEB_URL
-    if args.whiteboard:
-        # get whiteboard
-        wb = session_beaker.get(BEAKER_XML_URL).content
-        wb_text = ETree.fromstring(wb).findtext('whiteboard', '').strip()
-        desc += '\n' + wb_text
-    upd_url = f"{RP_BASE}/api/v1/{RP_PROJECT}/launch/{launch_id}/update"
-    requests.put(upd_url, headers=headers, json={'description': desc})
-    logger.info("completely update description of Launch")
+    logger.info(f"Launch id is: {launch_id}")
 
 
 if __name__ == "__main__":
     session_beaker = create_session()
     session_rp = create_session()
-
-    if args.whiteboard:
-        try:
-            wb_xml = download_text(BEAKER_XML_URL, session_beaker)
-            wb = ETree.fromstring(wb_xml).findtext('whiteboard', '')
-        except Exception as e:
-            logger.error(f"add whiteboard failed: {e}")
-            wb = f'{JOB_ID}'
-    else:
-        wb = f'{JOB_ID}'
 
     try:
         junit_xml = download_text(JUNIT_URL, session_beaker)
