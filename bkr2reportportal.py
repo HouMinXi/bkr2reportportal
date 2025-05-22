@@ -98,6 +98,7 @@ class JUnitLogProcessor:
         self.taskid_resultid = defaultdict(list)  # key:task_id, value:[resultid,..]
         self.resultid_resultlog = defaultdict(list)  # key:resultid, value:[resultlog,..]
         self.url_context = {}  # key:logurl value: log
+        self.taskid_tests_name = defaultdict(list)
         self.taskid_tests_block = dict()  # key:task_id, value:dict{test_name:test_block}
         # parse jnuit
         if from_string:
@@ -165,9 +166,9 @@ class JUnitLogProcessor:
 
     def flushing_all_task(self):
         for testcase in self.root.findall('.//testcase'):
-            name = testcase.get('name', '').lower()
+            name = testcase.get('name', '')
             system_out = testcase.find('system-out')
-            if '(main)' in name:
+            if '(main)' in name.lower():
                 if system_out is None or not system_out.text:
                     logger.error("main case missing system-out")
                     sys.exit(1)
@@ -212,6 +213,12 @@ class JUnitLogProcessor:
                         if result_id not in self.taskid_resultid.get(task_id):
                             self.taskid_resultid[task_id].append(result_id)
 
+                        # build task_id -> test_name
+                        if task_id not in self.taskid_tests_name.keys():
+                            self.taskid_tests_name[task_id] = []
+                        if name not in self.taskid_tests_name.get(task_id):
+                            self.taskid_tests_name[task_id].append(name)
+
     def _get_taskout_by_task_id(self, task_id: str) -> str:
         urls = self.taskid_task_log_url.get(task_id)
         task_out_url = None
@@ -228,16 +235,21 @@ class JUnitLogProcessor:
     def normalize_test_name(test_name):
         return re.sub(r"(?<=\w)[\W_]+(?=\w)", "-", test_name)
 
-    def _parse_task_out_log(self, whole_task_out: str):
-        done_str = "Uploading resultoutputfile.log .done"
-        tasks_out = whole_task_out.split(done_str)
+    def _parse_task_out_log(self, task_id:str, whole_task_out: str):
         tests_block = dict()
-        for task_out in tasks_out:
-            match = TEST_BLOCK_TITLE_PATTERN.search(task_out)
+        for test_name in self.taskid_tests_name.get(task_id, []):
+            case_pattern = re.sub(r"(?<=\w)-", "[\\\\W\\\\s_]+", test_name)
+            pattern = re.compile(fr'{case_pattern}')
+            match = pattern.search(whole_task_out)
             if not match:
+                tests_block.update({test_name: whole_task_out})
                 continue
-            test_name = self.normalize_test_name(match.group(2))
-            tests_block.update({test_name: task_out[match.start():] + done_str})
+            done_match = re.search("Uploading resultoutputfile.log .done", whole_task_out[match.start():])
+            if not done_match:
+                continue
+            done_match_end = match.start() + done_match.end()
+            block = whole_task_out[match.start():done_match_end]
+            tests_block.update({test_name: block})
         return tests_block
 
     def parse_task_out_logs(self):
@@ -245,7 +257,7 @@ class JUnitLogProcessor:
             task_out = self._get_taskout_by_task_id(task_id)
             if not task_out:
                 continue
-            tests_block = self._parse_task_out_log(task_out)
+            tests_block = self._parse_task_out_log(task_id, task_out)
             self.taskid_tests_block.update({task_id: tests_block})
 
     @staticmethod
