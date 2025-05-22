@@ -5,6 +5,8 @@ import re
 import logging
 import tempfile
 import zipfile
+from re import search
+
 import requests
 import argparse
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
@@ -65,7 +67,7 @@ TASK_ID_PATTERN = re.compile(
     r'\bhttps?://[^/]+/recipes/\d+/tasks/(\d+)(?:/|/results/\d+)?/logs/\S+\.log\b',
     re.IGNORECASE
 )
-
+TEST_BLOCK_TITLE_PATTERN = re.compile(r'(:{70,}\s*)\n::\s{2,}(.+?)\s*\n\1')
 
 def retry_download(max_retries=5, delay=10):
     def decorator(func):
@@ -98,6 +100,7 @@ class JUnitLogProcessor:
         self.taskid_resultid = defaultdict(list)  # key:task_id, value:[resultid,..]
         self.resultid_resultlog = defaultdict(list)  # key:resultid, value:[resultlog,..]
         self.url_context = {}  # key:logurl value: log
+        self.taskid_tests_block = dict() # key:task_id, value:dict{test_name:test_block}
         # parse jnuit
         if from_string:
             # from http request
@@ -210,35 +213,49 @@ class JUnitLogProcessor:
                         if result_id not in self.taskid_resultid.get(task_id):
                             self.taskid_resultid[task_id].append(result_id)
 
-    def _get_taskout_by_task_id(self, task_id: str) -> str:
+    def _get_task_out_by_task_id(self, task_id: str) -> str:
         urls = self.taskid_task_log_url.get(task_id)
-        taskout_url = None
+        task_out_url = None
         for url in urls:
             if url.endswith('/taskout.log'):
-                taskout_url = url
+                task_out_url = url
                 break
-        return self.url_context.get(taskout_url)
+        if not task_out_url:
+            logger.error(f"the taskout.log url of task_id {task_id} not found")
+            return ""
+        return self.url_context.get(task_out_url)
 
     @staticmethod
-    def _get_taskout_of_testcase(whole_taskout: str, testcase: str) -> str:
-        case_pattern = re.sub(r"(?<=\w)-", "[\\\\W_]+", testcase)
-        pattern = re.compile(r'^::\s{2,}' + fr'{case_pattern}\s*$')
-        lines = whole_taskout.split('\n')
-        start_index = None
-        for i in range(len(lines)):
-            if pattern.match(lines[i].strip()):
-                start_index = i
-                break
-        if not start_index:
-            return ""
-        end_index = None
-        for i in range(start_index, len(lines)):
-            if "Uploading resultoutputfile.log .done" in lines[i].strip():
-                end_index = i
-                break
-        if not end_index:
-            return ""
-        return "\n".join(lines[start_index-1:end_index + 1])
+    def normalize_test_name(test_name):
+        return re.sub(r"(?<=\w)[\W_]+(?=\w)", "-", test_name)
+
+    def _parse_task_out_log(self, whole_task_out: str):
+        done_str = "Uploading resultoutputfile.log .done"
+        tasks_out = whole_task_out.split(done_str)
+        tests_block = dict()
+        for task_out in tasks_out:
+            match = TEST_BLOCK_TITLE_PATTERN.search(task_out)
+            if not match:
+                continue
+            test_name = self.normalize_test_name(match.group(2))
+            tests_block.update({test_name: task_out[match.start():] + done_str})
+        return tests_block
+
+    def parse_task_out_logs(self):
+        for task_id in self.taskid_task_log_url.keys():
+            task_out = self._get_task_out_by_task_id(task_id)
+            if not task_out:
+                continue
+            tests_block = self._parse_task_out_log(task_out)
+            self.taskid_tests_block.update({task_id: tests_block})
+
+    @staticmethod
+    def search_task_id_from_system_out(system_out):
+        for url in system_out.text.strip().splitlines():
+            contain_task_id = TASK_ID_PATTERN.search(url)
+            if contain_task_id:
+                return contain_task_id.group(1)
+        return None
 
     def _attach_logs_to_subcases(self):
         for testcase in self.root.findall('.//testcase'):
@@ -250,35 +267,26 @@ class JUnitLogProcessor:
             system_out = testcase.find('system-out')
             if len(system_out.text.strip().splitlines()) == 0:
                 continue
-            task_id = None
-            for url in system_out.text.strip().splitlines():
-                contain_task_id = TASK_ID_PATTERN.search(url)
-                if contain_task_id:
-                    task_id = contain_task_id.group(1)
-                    break
-            if not task_id:
-                if self.debug:
-                    logger.debug(f"didn't found task_id on sub kernel test cases: {classname} {name}")
-                    continue
-            whole_taskout = self._get_taskout_by_task_id(task_id)
-            if not whole_taskout:
-                if self.debug:
-                    logger.debug(f"didn't find corresponding taskout.log {task_id} {classname} {name}")
-                    continue
-            testcase_taskout = self._get_taskout_of_testcase(whole_taskout, name)
+            task_id = self.search_task_id_from_system_out(system_out)
+            if not task_id and self.debug:
+                logger.debug(f"didn't found task_id on sub kernel test cases: {classname} {name}")
+                continue
+            if task_id in self.taskid_tests_block.keys():
+                test_block = self.taskid_tests_block.get(task_id).get(name)
+            else:
+                continue
 
             # Build log content
             log_content = []
             if system_out.text:
                 log_content.append(system_out.text.strip())
-            if testcase_taskout:
+            if test_block:
                 log_content.append(f"\n=== Matched Log from (task_id={task_id}) ===")
-                log_content.append(testcase_taskout)
+                log_content.append(test_block)
             else:
                 if self.debug:
-                    logger.debug("_attach_logs_to_subcases:" + testcase_taskout)
+                    logger.debug("_attach_logs_to_subcases:" + test_block)
                 log_content.append("\n=== No related log found in taskout.log ===")
-
             system_out.text = '\n'.join(log_content)
 
     def _clean_non_kernel(self):
