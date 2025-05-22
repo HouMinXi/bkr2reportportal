@@ -64,8 +64,6 @@ TASK_ID_PATTERN = re.compile(
     r'\bhttps?://[^/]+/recipes/\d+/tasks/(\d+)(?:/|/results/\d+)?/logs/\S+\.log\b',
     re.IGNORECASE
 )
-TEST_BLOCK_TITLE_PATTERN = re.compile(r'(:{70,}\s*)\n::\s{2,}(.+?)\s*\n\1')
-
 
 def retry_download(max_retries=10, delay=10):
     def decorator(func):
@@ -256,6 +254,7 @@ class JUnitLogProcessor:
         for task_id in self.taskid_task_log_url.keys():
             task_out = self._get_taskout_by_task_id(task_id)
             if not task_out:
+                logger.warning(f"the taskout.log url of task_id {task_id} not found or the taskout.log is empty.")
                 continue
             tests_block = self._parse_task_out_log(task_id, task_out)
             self.taskid_tests_block.update({task_id: tests_block})
@@ -285,10 +284,9 @@ class JUnitLogProcessor:
                 logger.debug(f"didn't found task_id on sub kernel test cases: {classname} {name}")
                 continue
             if task_id in self.taskid_tests_block.keys():
-                test_block = self.taskid_tests_block.get(task_id).get(name, '')
+                test_block = self.taskid_tests_block.get(task_id).get(name)
             else:
                 continue
-
             # Build log content
             log_content = []
             if system_out.text:
