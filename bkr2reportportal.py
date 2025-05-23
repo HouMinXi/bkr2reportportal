@@ -79,16 +79,18 @@ def retry_download(max_retries=10, delay=10):
                         raise
                     sleep(delay * attempt)
             return None
+
         return wrapper
+
     return decorator
 
 
 class CaseProperty:
-    def __init__(self):
+    def __init__(self, name):
         """
         initial property of failed cases
         """
-
+        self.name = name
         """
         if system-out has url, it can parse a taskid, no matter (main) or other cases
         """
@@ -100,7 +102,7 @@ class CaseProperty:
         """
         save all of logs from (main) case, no matter suffix .log
         """
-        self.main_task_urls = []
+        self.task_out_url = ''
         """
         save resultoutfiles.log from non-main case
         """
@@ -114,14 +116,9 @@ class CaseProperty:
         """
         self.failure_message = ''
         """
-        if case has errpr key, if True then skip this case search
-        """
-        self.error = False
-        """
         if a sub test cases failed and has multiple url in systemout, we should search more detail log from taskout.log
         """
         self.search_log_block = ''
-
 
 
 class JUnitLogProcessor:
@@ -134,21 +131,19 @@ class JUnitLogProcessor:
         """
         self.debug = debug
         """this dict use for show relationship on reportportal"""
-        self.host_role_map = {}  # key:hostname, value: role
+        self.host_role_map = defaultdict(str)  # key:hostname, value: role
         """make relationship between taskid and taskurl"""
-        self.taskid_task_log_url = defaultdict(list)  # key:task_id, value:[taskout_url,..]
+        self.taskid_task_log_url = defaultdict(str)  # key:task_id, value:[taskout_url,..]
         """make relationship between taskid and resultid"""
         self.taskid_resultid = defaultdict(list)  # key:task_id, value:[resultid,..]
-        """make relationship between resultid and result_log"""
-        self.resultid_resultlog = defaultdict(list)  # key:resultid, value:[resultlog,..]
         """
         make relationship between url and context, this dick use when parse log.
         """
-        self.url_context = {}  # key:logurl value: log
-        """make relationship between taskid and testname which come from junit"""
-        self.taskid_tests_name = defaultdict(list)  # key: taskid, value:[task_name from junit.xml,..]
-        """make relationship between taskid and test_block which already search by taskout.log"""
-        self.taskid_tests_block = dict()  # key:task_id, value:dict{test_name:test_block}
+        self.url_context = defaultdict(str)  # key:logurl value: log
+        """
+        assume a uniq id as taskid_resultid for search log
+        """
+        self.testcases = {}  # key:taskid_resultid value:CaseProperty()
 
         if from_string:
             # from http request
@@ -213,68 +208,68 @@ class JUnitLogProcessor:
         # attach taskout.log phase to subcases
         self._attach_logs_to_subcases()
 
-    def flushing_all_task(self):
-        for testcase in self.root.findall('.//testcase'):
-            name = testcase.get('name', '')  # got raw name from junit.xml
-            system_out = testcase.find('system-out')
-            failure_element = testcase.find('./failure')
-            error_element = testcase.find('./error')
-            if error_element is not None:
-                # if find error element that means this task no output
+    def flushing_all_tasks(self):
+        # first search the main
+        for testcase in self.root.findall(".//testcase[@name='(main)']"):
+            classname = testcase.get("classname", "")
+            if not classname.startswith("/kernel"):
                 continue
-            if failure_element is not None:
-                #  that means this testcase failed need collect information.
-                failure_message = failure_element.get('message', '')
-            if '(main)' in name.lower():
-                if system_out is None or not system_out.text:
-                    logger.error("main case missing system-out")
-                    sys.exit(1)
-                # got url of taskout.log
-                taskout_urls = [
-                    url.strip() for url in system_out.text.splitlines()
-                    if 'taskout.log' in url.lower()
-                ]
-                # got task_id
-                for url in system_out.text.splitlines():
-                    task_match = TASK_ID_PATTERN.search(url)
-                    if task_match:
-                        task_id = task_match.group(1)
-                        if taskout_urls is not None:
-                            self.taskid_task_log_url[task_id].extend(taskout_urls)
-                            break
-                        else:
-                            self.taskid_task_log_url[task_id] = []
-                    else:
-                        logger.warning("pattern task_id failed")
-            else:
-                if system_out is None or not system_out.text:
-                    continue
-                result_urls = [
+            system_out = testcase.find('system-out')
+            if system_out is None or not system_out.text:
+                logger.error("main case missing system-out")
+                sys.exit(1)
+            # got url of taskout.log
+            taskout_url = ""
+            for url in system_out.text.strip().splitlines():
+                if 'taskout.log' in url.lower():
+                    taskout_url = url
+                    break
+            if not taskout_url:
+                logger.error(f"main case missing taskout.log, classname is: {classname}")
+                sys.exit(1)
+            task_match = TASK_ID_PATTERN.search(taskout_url)
+            if not task_match:
+                logger.warning("pattern task_id failed")
+                continue
+            task_id = task_match.group(1)
+            self.taskid_task_log_url[task_id] = f"{taskout_url}"
+        # second search the non-main
+        for testcase in self.root.findall('.//testcase'):
+            if (testcase.get("classname", "").startswith("/kernel")
+                    or '(main)' == testcase.get("name", "")):
+                continue
+            error_element = testcase.find('./error')
+            if error_element:
+                continue
+            name = testcase.get('name', '').strip()
+            system_out = testcase.find('system-out')
+            subcase = CaseProperty(name)
+            failure_element = testcase.find('./failure')
+            if failure_element:
+                subcase.failure = True
+                subcase.failure_message = failure_element.get('message', '')
+            if system_out is not None and system_out.text:
+                subcase.sub_task_urls = [
                     url.strip() for url in system_out.text.splitlines()
                     if 'resultoutputfile.log' in url.lower()
                 ]
-
                 for url in system_out.text.splitlines():
                     result_match = RESULT_ID_PATTERN.search(url)
                     if result_match:
-                        result_id = result_match.group(2)
-                        task_id = result_match.group(1)
-                        # build result_id -> resultoutput.log
-                        if result_id not in self.resultid_resultlog.keys():
-                            self.resultid_resultlog[result_id] = []
-                        self.resultid_resultlog[result_id].extend(result_urls)
-
-                        # build task_id -> result_id
-                        if task_id not in self.taskid_resultid.keys():
-                            self.taskid_resultid[task_id] = []
-                        if result_id not in self.taskid_resultid.get(task_id):
-                            self.taskid_resultid[task_id].append(result_id)
-
-                        # build task_id -> test_name
-                        if task_id not in self.taskid_tests_name.keys():
-                            self.taskid_tests_name[task_id] = []
-                        if name not in self.taskid_tests_name.get(task_id):
-                            self.taskid_tests_name[task_id].append(name)
+                        subcase.resultid = result_match.group(2)
+                        subcase.taskid = result_match.group(1)
+                        if subcase.taskid in self.taskid_task_log_url.keys():
+                            subcase.task_out_url = self.taskid_task_log_url[subcase.taskid]
+                    else:
+                        logger.warning(
+                            f"""didn't found taskid/resultid on system-out from {testcase.get("classname")}"""
+                        )
+                        continue
+            else:
+                logger.debug(f"""didn't found any log on system-out from {testcase.get("classname")}""")
+                continue
+            combaine_id = f"{subcase.resultid}_{subcase.taskid}"
+            self.testcases[combaine_id] = subcase
 
     def _get_taskout_by_task_id(self, task_id: str) -> str:
         urls = self.taskid_task_log_url.get(task_id)
@@ -292,7 +287,7 @@ class JUnitLogProcessor:
     def normalize_test_name(test_name):
         return re.sub(r"(?<=\w)[\W_]+(?=\w)", "-", test_name)
 
-    def _parse_task_out_log(self, task_id:str, whole_task_out: str):
+    def _parse_task_out_log(self, task_id: str, whole_task_out: str):
         tests_block = dict()
         for test_name in self.taskid_tests_name.get(task_id, []):
             case_pattern = re.sub(r"(?<=\w)-", "[\\\\W\\\\s_]+", test_name)
