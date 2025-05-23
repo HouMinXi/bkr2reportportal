@@ -8,6 +8,7 @@ import zipfile
 import requests
 import argparse
 import json
+import gc
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -17,6 +18,9 @@ from functools import wraps
 from time import sleep
 from collections import defaultdict
 
+# exit 3: init mapping of resultid and taskid failed
+# exit 2: zip file over 32MB
+# exit 1: testsuites didn't find in junit.xml 
 parser = argparse.ArgumentParser()
 parser.add_argument('-j', '--job', required=True,
                     help='Beaker job id, format as J:233333 or 233333')
@@ -202,7 +206,7 @@ class JUnitLogProcessor:
     def process_all_subcases(self, session: requests.Session):
         """handle all test cases"""
         # build mapping between taskid, resultid and log...etc
-        self.flushing_all_task()
+        self.flushing_all_tasks()
         self.download_log_urls(session)
         self.parse_task_out_logs()
         # attach taskout.log phase to subcases
@@ -241,33 +245,36 @@ class JUnitLogProcessor:
             error_element = testcase.find('./error')
             if error_element:
                 continue
-            name = testcase.get('name', '').strip()
             system_out = testcase.find('system-out')
+            if system_out is None or system_out.text is None or len(system_out.text.strip().splitlines()) == 0:
+                continue
+            # assume task must has resultoutputfile.log
+            outputfile_urls = [
+                url.strip() for url in system_out.text.splitlines()
+                if 'resultoutputfile.log' in url.lower()
+            ]
+            if outputfile_urls is None:
+                continue
+            name = testcase.get('name', '').strip()
             subcase = CaseProperty(name)
             failure_element = testcase.find('./failure')
+            subcase.resultid = None
+            subcase.taskid = None
             if failure_element:
                 subcase.failure = True
                 subcase.failure_message = failure_element.get('message', '')
-            if system_out is not None and system_out.text:
-                subcase.sub_task_urls = [
-                    url.strip() for url in system_out.text.splitlines()
-                    if 'resultoutputfile.log' in url.lower()
-                ]
-                for url in system_out.text.splitlines():
-                    result_match = RESULT_ID_PATTERN.search(url)
-                    if result_match:
-                        subcase.resultid = result_match.group(2)
-                        subcase.taskid = result_match.group(1)
-                        if subcase.taskid in self.taskid_task_log_url.keys():
-                            subcase.task_out_url = self.taskid_task_log_url[subcase.taskid]
-                    else:
-                        logger.warning(
-                            f"""didn't found taskid/resultid on system-out from {testcase.get("classname")}"""
-                        )
-                        continue
-            else:
-                logger.debug(f"""didn't found any log on system-out from {testcase.get("classname")}""")
-                continue
+            subcase.sub_task_urls = outputfile_urls
+            for url in outputfile_urls:
+                result_match = RESULT_ID_PATTERN.search(url)
+                if result_match:
+                    subcase.resultid = result_match.group(2)
+                    subcase.taskid = result_match.group(1)
+                    self.taskid_resultid[subcase.taskid].append(subcase.resultid)
+                    if subcase.taskid in self.taskid_task_log_url.keys():
+                        subcase.task_out_url = self.taskid_task_log_url[subcase.taskid]
+            if subcase.resultid is None or subcase.taskid is None:
+                logger.error(f"can't got resultid or taskid from {testcase.get('classname')} {name}")
+                sys.exit(3)
             combaine_id = f"{subcase.resultid}_{subcase.taskid}"
             self.testcases[combaine_id] = subcase
 
