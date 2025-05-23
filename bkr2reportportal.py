@@ -43,7 +43,7 @@ RP_PROJECT = args.project
 RP_TOKEN = args.token
 MAX_WORKERS = min(16, (os.cpu_count() or 4) * 4)
 
-# template
+# must have urls
 BEAKER_BASE = 'https://beaker.engineering.redhat.com'
 JUNIT_URL = f"{BEAKER_BASE}/jobs/{JOB_ID}.junit.xml"
 BEAKER_XML_URL = f"{BEAKER_BASE}/jobs/{JOB_ID}.xml"
@@ -65,6 +65,7 @@ TASK_ID_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+
 def retry_download(max_retries=10, delay=10):
     def decorator(func):
         @wraps(func)
@@ -78,27 +79,77 @@ def retry_download(max_retries=10, delay=10):
                         raise
                     sleep(delay * attempt)
             return None
-
         return wrapper
-
     return decorator
+
+
+class CaseProperty:
+    def __init__(self):
+        """
+        initial property of failed cases
+        """
+
+        """
+        if system-out has url, it can parse a taskid, no matter (main) or other cases
+        """
+        self.taskid = ''
+        """
+        if system-out url exist in a non-main case, it can parse a resultid
+        """
+        self.resultid = ''
+        """
+        save all of logs from (main) case, no matter suffix .log
+        """
+        self.main_task_urls = []
+        """
+        save resultoutfiles.log from non-main case
+        """
+        self.sub_task_urls = []
+        """
+        save case property of failure
+        """
+        self.failure = False
+        """
+        save failure message 
+        """
+        self.failure_message = ''
+        """
+        if case has errpr key, if True then skip this case search
+        """
+        self.error = False
+        """
+        if a sub test cases failed and has multiple url in systemout, we should search more detail log from taskout.log
+        """
+        self.search_log_block = ''
+
 
 
 class JUnitLogProcessor:
     def __init__(self, junit_xml_source, beaker_xml_source, from_string=False, debug=False):
         """
         :param junit_xml_source: XML string if from_string=True; otherwise a file path.
+        :param beaker_xml_source: XML string come from beaker job url
         :param from_string: Indicates whether junit_xml_source is file (False) or a string (True)
+        :param debug: enable debug log
         """
         self.debug = debug
+        """this dict use for show relationship on reportportal"""
         self.host_role_map = {}  # key:hostname, value: role
+        """make relationship between taskid and taskurl"""
         self.taskid_task_log_url = defaultdict(list)  # key:task_id, value:[taskout_url,..]
+        """make relationship between taskid and resultid"""
         self.taskid_resultid = defaultdict(list)  # key:task_id, value:[resultid,..]
+        """make relationship between resultid and result_log"""
         self.resultid_resultlog = defaultdict(list)  # key:resultid, value:[resultlog,..]
+        """
+        make relationship between url and context, this dick use when parse log.
+        """
         self.url_context = {}  # key:logurl value: log
-        self.taskid_tests_name = defaultdict(list)
+        """make relationship between taskid and testname which come from junit"""
+        self.taskid_tests_name = defaultdict(list)  # key: taskid, value:[task_name from junit.xml,..]
+        """make relationship between taskid and test_block which already search by taskout.log"""
         self.taskid_tests_block = dict()  # key:task_id, value:dict{test_name:test_block}
-        # parse jnuit
+
         if from_string:
             # from http request
             self.root = ETree.fromstring(junit_xml_source)
@@ -155,7 +206,7 @@ class JUnitLogProcessor:
 
     def process_all_subcases(self, session: requests.Session):
         """handle all test cases"""
-        # build mapping between taskid, resultid and log
+        # build mapping between taskid, resultid and log...etc
         self.flushing_all_task()
         self.download_log_urls(session)
         self.parse_task_out_logs()
@@ -164,8 +215,16 @@ class JUnitLogProcessor:
 
     def flushing_all_task(self):
         for testcase in self.root.findall('.//testcase'):
-            name = testcase.get('name', '')
+            name = testcase.get('name', '')  # got raw name from junit.xml
             system_out = testcase.find('system-out')
+            failure_element = testcase.find('./failure')
+            error_element = testcase.find('./error')
+            if error_element is not None:
+                # if find error element that means this task no output
+                continue
+            if failure_element is not None:
+                #  that means this testcase failed need collect information.
+                failure_message = failure_element.get('message', '')
             if '(main)' in name.lower():
                 if system_out is None or not system_out.text:
                     logger.error("main case missing system-out")
@@ -254,7 +313,6 @@ class JUnitLogProcessor:
         for task_id in self.taskid_task_log_url.keys():
             task_out = self._get_taskout_by_task_id(task_id)
             if not task_out:
-                logger.warning(f"the taskout.log url of task_id {task_id} not found or the taskout.log is empty.")
                 continue
             tests_block = self._parse_task_out_log(task_id, task_out)
             self.taskid_tests_block.update({task_id: tests_block})
@@ -277,16 +335,17 @@ class JUnitLogProcessor:
                 continue
             system_out = testcase.find('system-out')
             # assume no output
-            if len(system_out.text.strip().splitlines()) == 0:
+            if system_out is None or system_out.text is None or len(system_out.text.strip().splitlines()) == 0:
                 continue
             task_id = self.search_task_id_from_system_out(system_out)
             if not task_id and self.debug:
                 logger.debug(f"didn't found task_id on sub kernel test cases: {classname} {name}")
                 continue
             if task_id in self.taskid_tests_block.keys():
-                test_block = self.taskid_tests_block.get(task_id).get(name)
+                test_block = self.taskid_tests_block.get(task_id).get(name, '')
             else:
                 continue
+
             # Build log content
             log_content = []
             if system_out.text:
@@ -380,7 +439,7 @@ class JUnitLogProcessor:
         try:
             response = session.get(
                 url,
-                timeout=(15, 60),
+                timeout=(30, 60),
                 headers={'Referer': BEAKER_BASE},
             )
             response.raise_for_status()
@@ -426,19 +485,20 @@ def create_session() -> requests.Session:
     session = requests.Session()
     retries = Retry(
         total=10,
-        backoff_factor=1.5,
+        backoff_factor=2.5,
         status_forcelist=[429, 500, 502, 503, 504, 520],
         allowed_methods=frozenset(['GET', 'POST']),
         respect_retry_after_header=True,
-        connect=60,
-        read=60,
-        redirect=60,
-        other=60
+        connect=10,
+        read=10,
+        redirect=5,
+        other=5
     )
     adapter = HTTPAdapter(
         max_retries=retries,
         pool_connections=50,
-        pool_maxsize=100
+        pool_maxsize=100,
+        pool_block=True
     )
     session.mount('http://', adapter)
     session.mount('https://', adapter)
@@ -497,7 +557,7 @@ def upload_to_rp(zip_source_path: str, session: requests.Session):
             )
         }
         logger.info("upload ReportPortal：%s", zip_source_path)
-        resp = session.post(rp_url, headers=headers, files=files, timeout=300)
+        resp = session.post(rp_url, headers=headers, files=files, timeout=(30, 600), verify=False, allow_redirects=True)
     resp.raise_for_status()
     # resp.json method to parse it into Python dict objects.
     data = resp.json()
@@ -538,6 +598,13 @@ if __name__ == "__main__":
         arcname = sanitize_filename(f"bkr-junit-{JOB_ID}.xml")
         z.writestr(arcname, ETree.tostring(processor.root, encoding='utf-8'))
     logger.info("create ZIP：%s", zip_path)
+    file_size_bytes = os.path.getsize(zip_path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+    if file_size_mb > 32:
+        logger.error(f"Warning: File size {file_size_mb:.2f}MB exceeds 32MB limit")
+        sys.exit(2)
+    else:
+        logger.info(f"file size：{file_size_mb:.2f}MB")
 
     # upload
     try:
