@@ -8,20 +8,18 @@ import zipfile
 import requests
 import argparse
 import json
-import gc
+import xml.etree.ElementTree as ETree
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
 from requests.adapters import HTTPAdapter
-from unicodedata import normalize
 from urllib3.util.retry import Retry
-import xml.etree.ElementTree as ETree
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import wraps
+from functools import wraps, partial
 from time import sleep
 from collections import defaultdict
 
 # exit 3: init mapping of resultid and taskid failed
 # exit 2: zip file over 32MB
-# exit 1: testsuites didn't find in junit.xml 
+# exit 1: testsuites didn't find in junit.xml
 parser = argparse.ArgumentParser()
 parser.add_argument('-j', '--job', required=True,
                     help='Beaker job id, format as J:233333 or 233333')
@@ -33,6 +31,13 @@ parser.add_argument('-t', '--token', required=True,
                     help='Report Portal token')
 parser.add_argument('-d', '--debug', action='store_true',
                     help='enable debug mode')
+parser.add_argument('-w', '--whiteboard', action='store_true',
+                    help='Use beaker whiteboard as launch name, it may fail if whiteboard is too long.'
+                         ' any invalid character in whiteborad will exchange as - ')
+parser.add_argument('-n', '--launchname',
+                    help='self define test name, it appear as test name on reportportal lunch plane'
+                         'if not setting, the default name will appear as Beaker Job {JOB_ID}')
+
 args = parser.parse_args()
 if args.debug:
     logging.basicConfig(level=logging.DEBUG,
@@ -84,9 +89,7 @@ def retry_download(max_retries=10, delay=10):
                         raise
                     sleep(delay * attempt)
             return None
-
         return wrapper
-
     return decorator
 
 
@@ -149,6 +152,9 @@ class JUnitLogProcessor:
         assume a uniq id as taskid_resultid for search log
         """
         self.testcases = dict()  # key:taskid_resultid value:CaseProperty()
+        self.all_kernel_cases = list()
+        self.all_kernel_main_cases = list()
+        self.all_kernel_sub_cases = list()
 
         if from_string:
             # from http request
@@ -166,14 +172,14 @@ class JUnitLogProcessor:
 
         # parse beaker xml
         if beaker_xml_source and from_string:
-            beaker_root = ETree.fromstring(beaker_xml_source)
-            self._parse_beaker_xml(beaker_root)
+            self.beaker_root = ETree.fromstring(beaker_xml_source)
+            self._parse_beaker_xml(self.beaker_root)
         elif beaker_xml_source and from_string is not True:
             if not os.path.isfile(beaker_xml_source):
                 raise FileNotFoundError(f"JUnit file not found: {junit_xml_source}")
             beaker_tree = ETree.parse(beaker_xml_source)
-            beaker_root = beaker_tree.getroot()
-            self._parse_beaker_xml(beaker_root)
+            self.beaker_root = beaker_tree.getroot()
+            self._parse_beaker_xml(self.beaker_root)
 
     def _parse_beaker_xml(self, xml_root):
         """parse Beaker XML build the host-role mapping host_role_map[hostname] = CLIENTS/SERVERS"""
@@ -198,10 +204,10 @@ class JUnitLogProcessor:
         Change the testsuite name to task_id + hostname + role. it will display on detail page on a launch
         """
         for ts in self.root.findall('testsuite'):
-            ts_id = ts.get('id', '').strip()
+            #ts_id = ts.get('id', '').strip()
             ts_host = ts.get('hostname', '').strip()
             role = self.host_role_map.get(ts_host, 'UNKNOWN_ROLE')
-            new_name = f"{ts_id} {ts_host} {role}".strip()
+            new_name = f"{role}".strip()
             ts.set('name', new_name)
 
     def process_all_subcases(self, session: requests.Session):
@@ -214,14 +220,24 @@ class JUnitLogProcessor:
         self.attach_logs_to_subcases()
 
     def flushing_all_tasks(self):
+        self.all_kernel_cases = [
+            testcase for testcase in self.root.findall(".//testcase")
+            if testcase.get("classname", "").startswith("/kernel")
+        ]
+        self.all_kernel_main_cases = [
+            testcase for testcase in self.all_kernel_cases
+            if testcase.get("name", "").lower() == '(main)'
+        ]
+        self.all_kernel_sub_cases = [
+            testcase for testcase in self.all_kernel_cases
+            if testcase.get("name", "").lower() != '(main)'
+        ]
         # first search the main
-        for testcase in self.root.findall(".//testcase[@name='(main)']"):
+        for testcase in self.all_kernel_main_cases:
             classname = testcase.get("classname", "")
-            if not classname.startswith("/kernel"):
-                continue
             system_out = testcase.find('system-out')
             if system_out is None or not system_out.text:
-                logger.error("main case missing system-out")
+                logger.error(f"main case missing system-out on {classname}")
                 sys.exit(1)
             # got url of taskout.log
             taskout_url = ""
@@ -239,10 +255,7 @@ class JUnitLogProcessor:
             task_id = task_match.group(1)
             self.taskid_task_log_url[task_id] = taskout_url
         # second search the non-main
-        for testcase in self.root.findall('.//testcase'):
-            if (testcase.get("classname", "").startswith("/kernel")
-                    or '(main)' == testcase.get("name", "").strip()):
-                continue
+        for testcase in self.all_kernel_sub_cases:
             error_element = testcase.find('./error')
             if error_element:
                 continue
@@ -252,7 +265,6 @@ class JUnitLogProcessor:
             # assume task must have resultoutputfile.log
             outputfile_urls = [
                 url.strip() for url in system_out.text.splitlines()
-                if 'resultoutputfile.log' in url.lower()
             ]
             if outputfile_urls is None:
                 continue
@@ -261,7 +273,7 @@ class JUnitLogProcessor:
             failure_element = testcase.find('./failure')
             subcase.resultid = None
             subcase.taskid = None
-            if failure_element:
+            if failure_element is not None:
                 subcase.failure = True
                 subcase.failure_message = failure_element.get('message', '')
             subcase.sub_task_urls = outputfile_urls
@@ -274,10 +286,11 @@ class JUnitLogProcessor:
                     subcase.task_out_url = self.taskid_task_log_url.get(subcase.taskid, "")
                     if not subcase.task_out_url and self.debug:
                         logger.debug(f"{subcase.taskid} has no taskout.log")
+                    break
             if subcase.resultid is None or subcase.taskid is None:
                 logger.error(f"can't got resultid or taskid from {testcase.get('classname')} {name}")
                 sys.exit(3)
-            combaine_id = f"{subcase.resultid}_{subcase.taskid}"
+            combaine_id = f"{subcase.taskid}_{subcase.resultid}"
             self.testcases[combaine_id] = subcase
 
     def _get_taskout_by_task_id(self, task_id: str) -> str:
@@ -294,19 +307,22 @@ class JUnitLogProcessor:
     def set_subcase_new_block(self):
         for subcase in self.testcases.values():
             if subcase.failure:
-                subcase.new_block += f"{subcase.failure_message}\n" if subcase.failure_message else ""
+                subcase.new_block += f"Below message come from junit.xml\n {subcase.failure_message}\n" if (
+                    subcase.failure_message) else ""
                 for url in subcase.sub_task_urls:
+                    subcase.new_block += f"\n=== Come from url: {url} ===\n"
                     subcase.new_block += self.url_context.get(url)
 
-            match_log_title = f"\n=== Matched Log from {subcase.taskid} taskout.log ==="
-            no_match_log_title = f"\n=== No related log found in {subcase.taskid} taskout.log ==="
-
-            normalized_name = self.normalize_test_name(subcase.name)
-            case_pattern = re.sub(r"(?<=\w)-", "[\\\\W\\\\s_]+", normalized_name)
+            match_log_title = f"\n=== Matched Log from {subcase.taskid} taskout.log ===\n"
+            no_match_log_title = f"\n=== No related log found in {subcase.taskid} taskout.log ===\n"
+            normalize_name = self.normalize_test_name(subcase.name)
+            # test case name from junit.xml and re-build a new regx
+            case_pattern = re.sub(r"(?<=\w)-", "[\\\\W\\\\s_]+", normalize_name)
             pattern = re.compile(r'::\s{2,}' + fr'{case_pattern}')
             whole_task_out = self._get_taskout_by_task_id(subcase.taskid)
             match = pattern.search(whole_task_out)
             if not match:
+                # assume only one or no subcases
                 if len(self.taskid_resultid[subcase.taskid]) < 2:
                     subcase.new_block += match_log_title
                     subcase.new_block += whole_task_out
@@ -324,7 +340,7 @@ class JUnitLogProcessor:
     @staticmethod
     def search_taskid_and_resultid_from_system_out(system_out):
         for url in system_out.text.strip().splitlines():
-            match = TASK_ID_PATTERN.search(url)
+            match = RESULT_ID_PATTERN.search(url)
             if match:
                 return "_".join([match.group(1), match.group(2)])
         return None
@@ -335,33 +351,54 @@ class JUnitLogProcessor:
             # Only handles non-main kernel test cases
             classname = testcase.get('classname', '')
             name = testcase.get("name", "").strip()
-            if classname.startswith("/kernel") or name == '(main)':
+            if not classname.startswith("/kernel"):
                 continue
-            test_block = None
-            system_out = testcase.find('system-out')
-            # assume no output
-            if system_out is None or system_out.text is None or len(system_out.text.strip().splitlines()) == 0:
-                failure_element = testcase.find('./failure')
-                if failure_element and failure_element.get('message'):
-                    test_block = failure_element.get('message')
-            else:
-                taskid_resultid = self.search_taskid_and_resultid_from_system_out(system_out)
-                if not taskid_resultid:
-                    logger.error(f"didn't found task_id on sub kernel test cases: {classname} {name}")
+            elif name != '(main)':  # for sub kernel case
+                test_block = None
+                system_out = testcase.find('system-out')
+                # assume no output
+                if system_out is None or system_out.text is None or len(system_out.text.strip().splitlines()) == 0:
+                    failure_element = testcase.find('./failure')
+                    if failure_element and failure_element.get('message'):
+                        test_block = failure_element.get('message')
+                else:
+                    taskid_resultid = self.search_taskid_and_resultid_from_system_out(system_out)
+                    if not taskid_resultid:
+                        logger.error(f"didn't found task_id on sub kernel test cases: {classname} {name}")
+                        continue
+                    subcase = self.testcases.get(taskid_resultid)
+                    if not subcase:
+                        logger.warning(f"didn't found subcase on sub kernel test cases: {classname} {name}")
+                        continue
+                    test_block = subcase.new_block
+                # Build log content
+                log_content = []
+                if system_out.text:
+                    log_content.append(system_out.text.strip())
+                if test_block:
+                    log_content.append(test_block)
+                system_out.text = '\n'.join(log_content)
+            elif name == '(main)':
+                taskout_url = ""
+                system_out = testcase.find('system-out')
+                for url in system_out.text.strip().splitlines():
+                    if 'taskout.log' in url.lower():
+                        taskout_url = url
+                        break
+                if not taskout_url:
+                    logger.error(f"main case missing taskout.log, classname is: {classname}")
+                    sys.exit(1)
+                task_match = TASK_ID_PATTERN.search(taskout_url)
+                if not task_match:
+                    logger.warning("pattern task_id failed")
                     continue
-                subcase = self.testcases.get(taskid_resultid)
-                if not subcase:
-                    logger.warning(f"didn't found subcase on sub kernel test cases: {classname} {name}")
-                    continue
-                test_block = subcase.new_block
-
-            # Build log content
-            log_content = []
-            if system_out.text:
-                log_content.append(system_out.text.strip())
-            if test_block:
-                log_content.append(test_block)
-            system_out.text = '\n'.join(log_content)
+                task_id = task_match.group(1)
+                log_content = []
+                if system_out.text:
+                    log_content.append(system_out.text.strip())
+                if task_id:
+                    log_content.append(self._get_taskout_by_task_id(task_id))
+                system_out.text = '\n'.join(log_content)
 
     def _clean_non_kernel(self):
         """
@@ -417,16 +454,17 @@ class JUnitLogProcessor:
                     testsuite.append(new_tc)
 
     def download_log_urls(self, session: requests.Session):
-        tasks = []
+        tasks = [item for item in self.taskid_task_log_url.values()]
         # all of taskout.log
-        tasks.extend([item for sublist in self.taskid_task_log_url.values() for item in sublist])
         # all of resoultoutput.log
         for subcase in self.testcases.values():
             tasks.extend(subcase.sub_task_urls)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_map = {}
             for url in tasks:
-                future = executor.submit(self._download_log_content, url, session)
+                future = executor.submit(
+                    partial(self._download_log_content, url=url, session=session)
+                )
                 future_map[future] = url
 
             for future in as_completed(future_map):
@@ -439,6 +477,7 @@ class JUnitLogProcessor:
 
     @retry_download(max_retries=30)
     def _download_log_content(self, url: str, session: requests.Session) -> str:
+        logger.debug(f"instance self address: {hex(id(self))}")
         """download log"""
         try:
             response = session.get(
@@ -540,6 +579,15 @@ def download_text(download_url: str, session: requests.Session) -> str:
 
 
 def upload_to_rp(zip_source_path: str, session: requests.Session):
+    if args.whiteboard:
+        whiteboard = processor.beaker_root.find('whiteboard').text
+        logger.info("got launch name from beaker xml whiteboard：%s", whiteboard)
+        lunchname = sanitize_filename(whiteboard).strip()[:100]
+    elif args.launchname:
+        logger.info("got launch name from self define name：%s", args.launchname)
+        lunchname = sanitize_filename(args.launchname).strip()[:100]
+    else:
+        lunchname = f"Beaker Job {JOB_ID}"
     rp_url = f"{RP_BASE}/api/v1/{RP_PROJECT}/launch/import"
     headers = {
         'Authorization': f'bearer {RP_TOKEN}',
@@ -555,7 +603,7 @@ def upload_to_rp(zip_source_path: str, session: requests.Session):
                 json.dumps({
                     "description": f"Beaker Job {JOB_WEB_URL}",
                     "mode": "DEFAULT",
-                    "name": f"Beaker Job {JOB_ID}"
+                    "name": f"{lunchname}"
                 }),
                 'application/json'
             )
