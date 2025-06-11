@@ -345,6 +345,11 @@ class JUnitLogProcessor:
                 return "_".join([match.group(1), match.group(2)])
         return None
 
+    def _build_failure_element(self, text):
+        new_element = ETree.Element("failure")
+        new_element.text = text
+        return new_element
+
     def attach_logs_to_subcases(self):
         """Deal with the subcases of kernel test cases"""
         for testcase in self.root.findall('.//testcase'):
@@ -371,6 +376,8 @@ class JUnitLogProcessor:
                         logger.warning(f"didn't found subcase on sub kernel test cases: {classname} {name}")
                         continue
                     test_block = subcase.new_block
+                failure_element = self._build_failure_element(test_block)
+                testcase.insert(0, failure_element)
                 # Build log content
                 log_content = []
                 if system_out.text:
