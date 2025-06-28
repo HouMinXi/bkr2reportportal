@@ -30,6 +30,7 @@ import requests
 import argparse
 import json
 import xml.etree.ElementTree as ETree
+import html
 from requests.exceptions import HTTPError, ConnectionError, Timeout, RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -238,6 +239,10 @@ class JUnitLogProcessor:
             role = self.host_role_map.get(ts_host, 'UNKNOWN_ROLE')
             new_name = f"{role}".strip()
             ts.set('name', new_name)
+
+    def double_escape(self, log_content):
+        html_escaped = html.escape(log_content)
+        return html_escaped
 
     def process_all_subcases(self, session: requests.Session):
         """handle all test cases"""
@@ -523,7 +528,7 @@ class JUnitLogProcessor:
             for future in as_completed(future_map):
                 url = future_map[future]
                 try:
-                    content = future.result()
+                    content = self.double_escape(future.result())
                     self.url_context[url] = str(content)
                 except Exception as error:
                     logger.error(f"handle url failed {url}: {str(error)}")
@@ -719,9 +724,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # cleanup
-    #try:
-    #    os.remove(zip_path)
-    #except OSError:
-    #    pass
+    try:
+        os.remove(zip_path)
+    except OSError:
+        pass
 
     logger.info("All completed, please check Report Portal")
